@@ -149,40 +149,61 @@ def parse_metrica_epts(tracking_path: str, metadata_path: str) -> pd.DataFrame:
 
     # 提取球员信息
     # XML 结构: <Player id="P3578" teamId="FIFATMA">
-    #             <Name>Player 11</Name>
     #             <ShirtNumber>11</ShirtNumber>
     #             ...
     #           </Player>
-    # 注意: id 和 teamId 是 XML 属性 (attribute)，不是子元素
-    player_info = {}     # pid -> (team_prefix, jersey)
-    player_order = []    # 保持顺序，对应 tracking 数据中的坐标顺序
+    #
+    # 关键问题: XML 列出所有球员(含替补)共 35 人，但 tracking.txt
+    # 每行只有 22 个位置 (11 HOME + 11 AWAY)。
+    #
+    # 映射规则:
+    #   - tracking 位置 0-10  -> HOME 队首发 11 人 (XML 中前 11 个 HOME)
+    #   - tracking 位置 11-21 -> AWAY 队首发 11 人 (XML 中前 11 个 AWAY)
+    #   - 替补球员不在追踪数据中占独立位置
+
+    home_players = []   # (pid, jersey)
+    away_players = []
 
     for player in root.iter(f"{ns}Player"):
-        # elem.attrib 是一个字典，存储 XML 元素的属性
-        # 例如 <Player id="P3578" teamId="FIFATMA"> 的 attrib = {"id": "P3578", "teamId": "FIFATMA"}
         pid = player.attrib.get("id")
         team_id = player.attrib.get("teamId", "unknown")
 
-        # 球衣号码在子元素 <ShirtNumber> 里
         jersey_elem = player.find(f"{ns}ShirtNumber")
         jersey = jersey_elem.text.strip() if jersey_elem is not None else pid
 
         if pid:
-            # FIFATMA = Team A (home), FIFATMB = Team B (away)
-            team_prefix = "home" if team_id.upper() in ("HOME", "FIFATMA") else "away"
-            player_info[pid] = (team_prefix, jersey)
-            player_order.append(pid)
+            is_home = team_id.upper() in ("HOME", "FIFATMA")
+            if is_home:
+                home_players.append((pid, jersey))
+            else:
+                away_players.append((pid, jersey))
+
+    # 只取每队前 11 人 (首发)，其余为替补
+    HOME_STARTERS = 11
+    AWAY_STARTERS = 11
+    home_starters = home_players[:HOME_STARTERS]
+    away_starters = away_players[:AWAY_STARTERS]
+
+    # 构建有序映射: tracking位置 -> (pid, team, jersey)
+    # 位置 0-10 = home, 位置 11-21 = away
+    tracking_map = []   # index -> (pid, team_prefix, jersey)
+    for pid, jersey in home_starters:
+        tracking_map.append((pid, "home", jersey))
+    for pid, jersey in away_starters:
+        tracking_map.append((pid, "away", jersey))
 
     print(f"  帧率: {frame_rate}Hz")
     print(f"  上半场: 帧 {half1_start}-{half1_end}")
     print(f"  下半场: 帧 {half2_start}-{half2_end}")
-    print(f"  球员数: {len(player_order)}")
+    print(f"  XML 总球员: {len(home_players)} HOME + {len(away_players)} AWAY = {len(home_players)+len(away_players)}")
+    print(f"  首发映射: {len(tracking_map)} (11 HOME + 11 AWAY)")
 
     # ---- 解析 tracking.txt ----
     frames = []
     periods = []
     timestamps = []
-    player_positions = {pid: ([], []) for pid in player_order}
+    # 为每个首发球员创建位置列表
+    player_positions = {pid: ([], []) for pid, _, _ in tracking_map}
     ball_x_list = []
     ball_y_list = []
 
@@ -211,9 +232,9 @@ def parse_metrica_epts(tracking_path: str, metadata_path: str) -> pd.DataFrame:
             periods.append(period)
             timestamps.append(round(elapsed, 4))
 
-            # 解析球员位置
+            # 解析球员位置: 只映射前 22 个位置
             player_data = parts[1].split(";")
-            for i, pid in enumerate(player_order):
+            for i, (pid, _, _) in enumerate(tracking_map):
                 if i < len(player_data):
                     coords = player_data[i].split(",")
                     try:
@@ -244,8 +265,7 @@ def parse_metrica_epts(tracking_path: str, metadata_path: str) -> pd.DataFrame:
         "timestamp": timestamps,
     })
 
-    for pid in player_order:
-        team_prefix, jersey = player_info[pid]
+    for pid, team_prefix, jersey in tracking_map:
         result[f"{team_prefix}_{jersey}_x"] = player_positions[pid][0]
         result[f"{team_prefix}_{jersey}_y"] = player_positions[pid][1]
 
