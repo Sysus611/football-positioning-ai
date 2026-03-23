@@ -45,9 +45,15 @@ def load_player_data(player_id: str, data_dir: str) -> tuple:
     if not os.path.exists(path):
         return None, None, None, None
 
+    print(f"  [DEBUG] 加载数据: {path}")
     data = np.load(path)
     X = data["X"]   # [n_samples, obs_frames, feat_dim]
     Y = data["Y"]   # [n_samples, pred_frames, 2]
+    print(f"  [DEBUG] 原始数据 X: {X.shape}, Y: {Y.shape}")
+    print(f"  [DEBUG] X 范围: [{X.min():.4f}, {X.max():.4f}], 均值: {X.mean():.4f}")
+    print(f"  [DEBUG] Y 范围: [{Y.min():.4f}, {Y.max():.4f}], 均值: {Y.mean():.4f}")
+    print(f"  [DEBUG] X 中 NaN 数: {np.isnan(X).sum()}, 零值占比: {(X==0).mean():.2%}")
+    print(f"  [DEBUG] Y 中 NaN 数: {np.isnan(Y).sum()}, 零值占比: {(Y==0).mean():.2%}")
 
     # 按 80/20 划分训练集和验证集
     n = len(X)
@@ -63,6 +69,7 @@ def load_player_data(player_id: str, data_dir: str) -> tuple:
     X_val = torch.from_numpy(X[split:])
     Y_val = torch.from_numpy(Y[split:])
 
+    print(f"  [DEBUG] 划分完成: 训练 {len(X_train)}, 验证 {len(X_val)}")
     return X_train, Y_train, X_val, Y_val
 
 
@@ -108,31 +115,41 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     lr = config["training"]["learning_rate"]
     pred_frames = config["window"]["pred_seconds"] * config["window"]["sample_rate"]
 
+    print(f"  [CONFIG] batch_size={batch_size}, epochs={epochs}, lr={lr}")
+    print(f"  [CONFIG] pred_frames={pred_frames}, obs_frames={X_train.shape[1]}")
+
     # DataLoader: 把数据打包成小批量 (mini-batch)
-    # TensorDataset 把 X 和 Y 配对
-    # DataLoader 负责批量加载、打乱顺序
     train_dataset = TensorDataset(X_train, Y_train)
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,    # 每个 epoch 随机打乱顺序
+        shuffle=True,
     )
 
     val_dataset = TensorDataset(X_val, Y_val)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
+    n_train_batches = len(train_loader)
+    n_val_batches = len(val_loader)
+    print(f"  [DEBUG] DataLoader: 训练 {n_train_batches} batches, 验证 {n_val_batches} batches")
+
     # 设备选择: 优先用 GPU
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"  设备: {device}")
+    print(f"  [DEVICE] {device}")
+    if device.type == "cuda":
+        print(f"  [DEVICE] GPU: {torch.cuda.get_device_name(0)}")
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        print(f"  [DEVICE] GPU Memory: {gpu_mem:.1f} GB")
 
     # 创建模型
     model = PlayerLSTM(
         input_dim=X_train.shape[2],
         pred_frames=pred_frames,
-    ).to(device)   # .to(device) 把模型移到 GPU 或 CPU
+    ).to(device)
 
     param_count = sum(p.numel() for p in model.parameters())
-    print(f"  模型参数: {param_count:,}")
+    print(f"  [MODEL] 参数量: {param_count:,}")
+    print(f"  [MODEL] 结构: LSTM({X_train.shape[2]}->128, 2层) + FC(128->64->{pred_frames*2})")
 
     # 损失函数: MSE (均方误差)
     # 预测位置与真实位置的平方差的平均值
@@ -155,30 +172,28 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     max_patience = 25   # 早停: 连续 25 个 epoch 无改善就停止
 
     start_time = time.time()
+    print(f"\n  {'Epoch':>5s} | {'Train Loss':>10s} | {'Val Loss':>10s} | {'Dist(m)':>8s} | {'LR':>10s} | {'Time':>6s} | Status")
+    print(f"  {'-'*5}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*6}-+-------")
 
     for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
+
         # --- 训练阶段 ---
-        model.train()   # 切换到训练模式 (启用 Dropout)
+        model.train()
         train_loss = 0.0
         n_batches = 0
 
         for batch_x, batch_y in train_loader:
-            # 把数据移到设备
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
-            # 前向传播: 模型预测
             pred = model(batch_x)
-
-            # 计算损失
             loss = criterion(pred, batch_y)
 
-            # 反向传播 + 更新参数
-            optimizer.zero_grad()   # 清除上一步的梯度
-            loss.backward()         # 反向传播计算梯度
-            # 梯度裁剪: 防止梯度爆炸 (LSTM 常见问题)
+            optimizer.zero_grad()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()        # 用梯度更新参数
+            optimizer.step()
 
             train_loss += loss.item()
             n_batches += 1
@@ -186,11 +201,10 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
         train_loss /= n_batches
 
         # --- 验证阶段 ---
-        model.eval()    # 切换到评估模式 (关闭 Dropout)
+        model.eval()
         val_loss = 0.0
         n_val_batches = 0
 
-        # torch.no_grad() 禁止梯度计算，节省内存和时间
         with torch.no_grad():
             for batch_x, batch_y in val_loader:
                 batch_x = batch_x.to(device)
@@ -202,22 +216,23 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
 
         val_loss /= n_val_batches
 
-        # 更新学习率
+        # 把 MSE loss 换算成直观的距离误差 (米)
+        # MSE 是归一化坐标的均方误差, 开根号×场地尺寸 ≈ 平均误差米数
+        avg_dist_m = (val_loss ** 0.5) * ((105 + 68) / 2)
+
         scheduler.step(val_loss)
 
-        # 打印进度 (每 10 个 epoch)
-        if epoch % 10 == 0 or epoch == 1:
-            elapsed = time.time() - start_time
-            lr_now = optimizer.param_groups[0]["lr"]
-            print(f"  Epoch {epoch:3d}/{epochs} | "
-                  f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
-                  f"LR: {lr_now:.6f} | {elapsed:.0f}s")
+        # 每 5 个 epoch 或首末 epoch 打印
+        epoch_time = time.time() - epoch_start
+        elapsed = time.time() - start_time
 
         # 保存最佳模型
+        is_best = False
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_epoch = epoch
             patience_counter = 0
+            is_best = True
 
             os.makedirs(model_dir, exist_ok=True)
             model_path = os.path.join(model_dir, f"{player_id}.pt")
@@ -231,13 +246,25 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
             }, model_path)
         else:
             patience_counter += 1
-            if patience_counter >= max_patience:
-                print(f"  早停! 连续 {max_patience} 个 epoch 无改善")
-                break
+
+        # 打印进度 (每 5 个 epoch 或第 1 个)
+        if epoch % 5 == 0 or epoch == 1 or is_best and epoch <= 5:
+            lr_now = optimizer.param_groups[0]["lr"]
+            status = "<< BEST" if is_best else f"patience {patience_counter}/{max_patience}"
+            print(f"  {epoch:5d} | {train_loss:10.6f} | {val_loss:10.6f} | {avg_dist_m:6.2f}m | {lr_now:10.7f} | {elapsed:5.0f}s | {status}")
+
+        if patience_counter >= max_patience:
+            print(f"  [STOP] 早停! 连续 {max_patience} 个 epoch 无改善")
+            break
 
     elapsed = time.time() - start_time
-    print(f"  完成! 最佳 epoch: {best_epoch}, "
-          f"最佳 val_loss: {best_val_loss:.6f}, 耗时: {elapsed:.0f}s")
+    best_dist_m = (best_val_loss ** 0.5) * ((105 + 68) / 2)
+    print(f"  {'='*70}")
+    print(f"  [DONE] {player_id} 训练完成!")
+    print(f"  [DONE] 最佳 epoch: {best_epoch}/{epoch}")
+    print(f"  [DONE] 最佳 val_loss: {best_val_loss:.6f} (~{best_dist_m:.2f}m 平均误差)")
+    print(f"  [DONE] 总耗时: {elapsed:.0f}s ({elapsed/60:.1f}min)")
+    print(f"  [DONE] 模型已保存: {model_dir}/{player_id}.pt")
 
 
 def main():
@@ -245,27 +272,45 @@ def main():
     data_dir = os.path.join(PROJECT_ROOT, "data", "tensors")
     model_dir = os.path.join(PROJECT_ROOT, "data", "models")
 
+    print(f"{'='*60}")
+    print(f"  Football Player Positioning AI - LSTM Training")
+    print(f"{'='*60}")
+    print(f"  [ENV] Python: {sys.version.split()[0]}")
+    print(f"  [ENV] PyTorch: {torch.__version__}")
+    print(f"  [ENV] CUDA: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  [ENV] GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  [ENV] 数据目录: {data_dir}")
+    print(f"  [ENV] 模型目录: {model_dir}")
+
     # 检查是否指定了球员
     target_player = sys.argv[1] if len(sys.argv) > 1 else None
 
+    total_start = time.time()
+
     if target_player:
-        # 训练指定球员
         train_player(target_player, config, data_dir, model_dir)
     else:
-        # 训练所有球员
         npz_files = sorted([
             f.replace(".npz", "")
             for f in os.listdir(data_dir)
             if f.endswith(".npz")
         ])
-        print(f"找到 {len(npz_files)} 个球员的训练数据")
+        print(f"\n  [PLAN] 找到 {len(npz_files)} 个球员: {npz_files}")
 
-        for pid in npz_files:
+        for i, pid in enumerate(npz_files):
+            print(f"\n  [PROGRESS] ===== 球员 {i+1}/{len(npz_files)} =====")
             train_player(pid, config, data_dir, model_dir)
 
-    print(f"\n{'='*50}")
-    print(f"全部训练完成! 模型目录: {model_dir}")
-    print(f"{'='*50}")
+    total_elapsed = time.time() - total_start
+    print(f"\n{'='*60}")
+    print(f"  全部训练完成!")
+    print(f"  总耗时: {total_elapsed:.0f}s ({total_elapsed/60:.1f}min)")
+    print(f"  模型目录: {model_dir}")
+    if os.path.exists(model_dir):
+        models = [f for f in os.listdir(model_dir) if f.endswith('.pt')]
+        print(f"  已训练模型: {len(models)} 个")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
