@@ -1,0 +1,22 @@
+# Data processing
+pandas>=2.0
+numpy>=1.24
+pyarrow>=12.0
+scipy>=1.10
+
+# Deep Learning
+torch>=2.0
+torchvision>=0.15
+
+# Tracking data loading
+kloppy>=3.0
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+
+# Configuration
+pyyaml>=6.0
+
+# Experiment tracking (optional)
+# wandb>=0.15

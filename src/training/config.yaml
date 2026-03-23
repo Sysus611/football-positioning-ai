@@ -1,0 +1,57 @@
+# 特征维度配置
+features:
+  # Phase 1 基础特征 (每个球员/实体)
+  phase1:
+    - name: position_norm     # 归一化位置 (x, y)
+      dim: 2
+    - name: velocity          # 速度向量 (vx, vy)
+      dim: 2
+    - name: acceleration      # 加速度向量 (ax, ay)
+      dim: 2
+    - name: rel_ball_pos      # 相对球位置 (dx, dy)
+      dim: 2
+    - name: rel_goal_pos      # 相对球门位置 (dx, dy)
+      dim: 2
+    - name: team_id           # 队伍标识 (0 or 1)
+      dim: 1
+    - name: is_ball_carrier   # 是否持球 (0 or 1)
+      dim: 1
+    # 总维度: 12
+
+  # 球的特征 (作为第23个实体)
+  ball:
+    - name: ball_position     # 球位置 (x, y)
+      dim: 2
+    - name: ball_velocity     # 球速度 (vx, vy)
+      dim: 2
+
+# 滑动窗口配置
+window:
+  obs_seconds: 3              # 观测窗口: 3秒
+  pred_seconds: 2             # 预测窗口: 2秒
+  sample_rate: 25             # 采样频率: 25Hz
+  stride_frames: 5            # 滑动步长: 5帧 (0.2秒)
+
+# 场地参数
+pitch:
+  length: 105.0               # 米
+  width: 68.0                 # 米
+
+# 数据质量校验
+validation:
+  max_speed: 12.0             # m/s, 超过视为异常
+  max_gap_seconds: 0.5        # 秒, 超过视为断裂
+
+# 训练配置
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  epochs: 100
+  optimizer: adamw
+  scheduler: cosine
+
+# 实体数量
+entities:
+  n_players: 22               # 22个球员
+  n_ball: 1                   # 1个球
+  n_total: 23                 # 总计
