@@ -16,7 +16,9 @@ features:
       dim: 1
     - name: is_ball_carrier   # 是否持球 (0 or 1)
       dim: 1
-    # 总维度: 12
+    - name: is_active          # 是否在场 (0=罚下/换下, 1=在场)
+      dim: 1
+    # 总维度: 13
 
   # 球的特征 (作为第23个实体)
   ball:
@@ -52,6 +54,6 @@ training:
 
 # 实体数量
 entities:
-  n_players: 22               # 22个球员
+  n_players: 22               # 最多22个球员 (红牌罚下时 < 22, 用 is_active=0 mask)
   n_ball: 1                   # 1个球
-  n_total: 23                 # 总计
+  n_total: 23                 # 固定23个slot, 缺少的实体用 mask 屏蔽

@@ -57,7 +57,7 @@ def download_file(url: str, dest_path: str) -> bool:
         urllib.request.urlretrieve(url, dest_path)
         # 获取文件大小 (MB)
         size_mb = os.path.getsize(dest_path) / (1024 * 1024)
-        print(f" ✓ ({size_mb:.1f} MB)")
+        print(f" OK ({size_mb:.1f} MB)")
         return True
     except Exception as e:
         print(f" ✗ 错误: {e}")

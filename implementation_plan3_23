@@ -1,0 +1,383 @@
+# 足球球员跑位AI —— 数据流水线与训练架构设计 (v2)
+
+> [!NOTE]
+> 已确认的决策：✅ 先用公开数据集跑通 → ✅ 采样频率 25Hz → ✅ 先从 LSTM baseline 开始迭代
+
+---
+
+## 1. 目标概述
+
+为足球球员跑位AI提供**连续时间段内球员相对位置信息**的深度学习训练数据源。核心目标：
+- 将比赛追踪数据转化为结构化的时序位置序列
+- 构建可重复、可扩展的数据流水线
+- 输出可直接喂入深度学习模型的 Tensor 数据集
+
+---
+
+## 2. 整体架构总览
+
+```mermaid
+flowchart LR
+    subgraph 数据采集
+        A1[比赛视频]
+        A2[GPS/IMU穿戴设备]
+        A3[公开数据集]
+    end
+
+    subgraph 位置提取
+        B1[视频目标检测 + 追踪]
+        B2[传感器数据解析]
+    end
+
+    subgraph 数据预处理
+        C1[坐标归一化]
+        C2[帧率对齐 & 插值]
+        C3[球员/球 ID关联]
+        C4[数据质量校验]
+    end
+
+    subgraph 特征工程
+        D1[相对位置计算]
+        D2[速度/加速度]
+        D3[球与持球人特征]
+        D4[滑动窗口切片]
+    end
+
+    subgraph 模型训练
+        E1[数据集构建 Dataset/DataLoader]
+        E2[LSTM baseline → Transformer]
+        E3[训练 & 评估]
+    end
+
+    subgraph 推理部署
+        F1[ONNX / TorchScript 导出]
+        F2[游戏引擎集成]
+    end
+
+    A1 --> B1
+    A2 --> B2
+    A3 --> C1
+    B1 --> C1
+    B2 --> C1
+    C1 --> C2 --> C3 --> C4
+    C4 --> D1 --> D2 --> D3 --> D4
+    D4 --> E1 --> E2 --> E3
+    E3 --> F1 --> F2
+```
+
+---
+
+## 3. 各阶段详细设计
+
+### 3.1 数据采集层 —— 公开数据集详细对比
+
+由于确认先用公开数据集，下表列出所有可用的开源追踪数据：
+
+| 数据集 | 比赛数 | 格式 | 数据内容 | 是否含球追踪 | 适用度 |
+|--------|--------|------|----------|-------------|--------|
+| **Metrica Sports** | 3 场 | CSV (Game 1-2) + EPTS/JSON (Game 3) | 22球员 + 球的连续 XY 追踪(25Hz)，坐标已归一化 [0,1]，场地 105×68m | ✅ 含球 XY | ⭐⭐⭐⭐⭐ **首选** |
+| **SkillCorner Open** | 9 场(欧洲联赛) + 10 场(澳超) | JSONL + CSV | 从广播画面提取的球员追踪，含球位置 | ✅ | ⭐⭐⭐⭐ |
+| **StatsBomb 360** | 数百场(部分) | JSON | **事件级**数据 + 360 freeze-frame(事件瞬间所有球员位置) | ⚠️ 仅事件瞬间 | ⭐⭐⭐ |
+| **Last Row (Liverpool)** | 19 个进球片段 | CSV | 短片段追踪(球员+球) | ✅ | ⭐⭐ |
+| **Signality/Hammarby** | 3 场 | CSV | 追踪+视频(未同步)，无事件 | ❌ | ⭐⭐ |
+
+> [!IMPORTANT]
+> **Metrica Sports CSV 格式详解**：每行一帧，列包括 `Period`, `Frame`, `Time [s]`, `ball_x`, `ball_y`, 以及每个球员的 `home_XX_x`, `home_XX_y`, `home_XX_d`(距离), `home_XX_s`(速度)，约 120 列。坐标已归一化到 [0,1]。
+>
+> **数据量评估**：3 场比赛 × 90 分钟 × 25Hz ≈ **40 万帧**，对于 LSTM baseline 足够起步，但后续需要更多数据。SkillCorner 的 19 场可以作为有力补充。
+
+#### 视频数据的替代方案（应对非固定机位）
+
+高水平比赛视频通常是**广播镜头（非固定机位）**，确实不方便做 Homography。替代路径：
+
+| 方案 | 说明 | 难度 |
+|------|------|------|
+| **① SkillCorner 方案** | 直接用 SkillCorner 等公司**已从广播视频提取好的追踪数据** | ⭐ 最简单 |
+| **② 自适应 Homography** | 逐帧检测球场标线，动态计算 Homography 矩阵（已有开源方案如 [narya](https://github.com/DonsetPG/narya)） | ⭐⭐⭐ |
+| **③ 战术摄像头** | 自行架设固定的广角/鱼眼摄像头录制训练赛 | ⭐⭐ 硬件成本 |
+
+> [!TIP]
+> **推荐路径**：Phase 1 用 Metrica + SkillCorner 公开数据跑通，Phase 3 再考虑是否接入自有视频。
+
+---
+
+### 3.2 位置提取层（仅视频源需要，Phase 3）
+
+```mermaid
+flowchart TB
+    V[原始视频帧] --> OD["球员检测\nYOLOv8 / RT-DETR"]
+    OD --> TK["多目标追踪\nByteTrack / BoT-SORT"]
+    TK --> HM["动态单应性变换\nHomography (逐帧)"]
+    HM --> WC["世界坐标 x,y"]
+```
+
+#### 球的高度估算
+
+> 用户问：空中的球如何标定高度？
+
+单目广播视频**无法直接获取球的 z 坐标**（高度），有以下方案：
+
+| 方案 | 精度 | 说明 |
+|------|------|------|
+| **忽略高度** | — | 跑位AI关注的是球员在**地面上的 2D 位置**，球的高度对跑位决策影响有限，可先忽略 |
+| **物理模型估算** | 中 | 通过球的 2D 轨迹曲线 + 重力模型拟合抛物线，反推 z 值 |
+| **多摄像头三角测量** | 高 | 需要 2+ 摄像头，用三角测量获得 3D 坐标 |
+| **球大小估算** | 低 | 通过球在画面中的像素大小变化反推距离/高度 |
+
+> **结论**：跑位模型的核心是球员的 2D 位置决策，球的高度信息优先级较低。Phase 1 建议忽略，后续根据需要再引入。
+
+---
+
+### 3.3 数据预处理层
+
+#### 3.3.1 统一坐标系
+
+```
+场地坐标系 (单位: 米)
+  ┌──────────────────────────────────────┐
+  │ (0,0)                        (105,0) │
+  │                                      │
+  │              (52.5, 34)              │
+  │                                      │
+  │ (0,68)                      (105,68) │
+  └──────────────────────────────────────┘
+```
+
+- 归一化到 `[0, 1]`：`x_norm = x / 105.0`, `y_norm = y / 68.0`
+- 进攻方向统一（必要时做镜像翻转）
+
+#### 3.3.2 时间对齐
+
+- 统一采样频率：**25 Hz**（你的分析正确：10Hz 下球员最高速 10m/s 时每帧移动 1m，粒度太粗）
+- 缺失帧做**三次样条插值**补齐
+- 记录每帧的绝对时间戳 + 比赛事件标签
+
+#### 3.3.3 球员 ID 关联 & 球追踪
+
+- 确保同一球员在整个时间段内 ID 不变
+- **球的位置单独追踪**
+- **标记持球人 ID**（通过距离阈值或事件数据关联）
+
+---
+
+### 3.4 特征工程层
+
+#### 核心数据结构 —— 可扩展设计
+
+> 用户问：维度还有很多（如球员基础信息），是否一开始就定好？
+
+**不需要一开始全部定好。** 推荐采用**分层设计**：
+
+```mermaid
+flowchart TB
+    subgraph "第1层：基础特征 (Phase 1 必须)"
+        F1["归一化位置 (2D)"]
+        F2["速度/加速度 (4D)"]
+        F3["相对球位置 (2D)"]
+        F4["相对球门位置 (2D)"]
+        F5["队伍标识 (1D)"]
+        F6["是否持球 (1D)"]
+    end
+
+    subgraph "第2层：球信息 (Phase 1 加入)"
+        F7["球的绝对位置 (2D)"]
+        F8["球的速度向量 (2D)"]
+        F9["持球人到球距离 (1D)"]
+    end
+
+    subgraph "第3层：扩展特征 (后续迭代)"
+        F10["球员体能属性 (速度/体力等)"]
+        F11["球员位置角色 (前锋/后卫等)"]
+        F12["比赛上下文 (比分/时间等)"]
+        F13["阵型标签"]
+    end
+```
+
+**关键原则**：特征维度 `D` 在代码中用配置文件管理，**增加新特征只需修改配置和特征提取函数**，不影响模型核心架构（因为 Transformer/LSTM 的输入维度可以通过配置改变）。
+
+```yaml
+# config.yaml 示例
+features:
+  phase1:
+    - name: position_norm    # (x, y)
+      dim: 2
+    - name: velocity         # (vx, vy)
+      dim: 2
+    - name: acceleration     # (ax, ay)
+      dim: 2
+    - name: rel_ball_pos     # (dx_ball, dy_ball)
+      dim: 2
+    - name: rel_goal_pos     # (dx_goal, dy_goal)
+      dim: 2
+    - name: team_id          # 0 or 1
+      dim: 1
+    - name: is_ball_carrier  # 0 or 1
+      dim: 1
+  # 总维度: 12
+
+  ball_features:            # 球作为第23个"实体"
+    - name: ball_position    # (x, y)
+      dim: 2
+    - name: ball_velocity    # (vx, vy)
+      dim: 2
+```
+
+#### 实体建模：球员 + 球
+
+每一帧的数据结构为 `[N_entities, D]`，其中 `N_entities = 22(球员) + 1(球) = 23`：
+
+| 实体 | 数量 | 特征维度 | 说明 |
+|------|------|----------|------|
+| 球员(双方) | 22 | 12 | 位置/速度/加速度/相对位置/队伍/持球 |
+| 球 | 1 | 12 | 位置/速度 + 其余用0填充（或用mask标识） |
+| **合计** | **23** | **12** | — |
+
+#### 滑动窗口切片
+
+```
+时间序列:  ──────[观测窗口 T_obs]──────[预测窗口 T_pred]──────
+              (e.g. 3秒 = 75帧)       (e.g. 2秒 = 50帧)
+```
+
+每个训练样本的 shape：
+
+```
+Input:  [T_obs,  N_entities, D]  = [75, 23, 12]   # 含球
+Target: [T_pred, N_entities, 2]  = [50, 23, 2]    # 预测位置(含球)
+```
+
+---
+
+### 3.5 存储格式
+
+| 阶段 | 格式 | 说明 |
+|------|------|------|
+| 原始追踪数据 | CSV / JSONL | Metrica CSV / SkillCorner JSONL |
+| 预处理后数据 | Parquet / HDF5 | 统一格式，高效读取 |
+| 训练 Tensor | `.pt` (PyTorch) | 按滑动窗口预切好的样本 |
+
+---
+
+### 3.6 模型训练层
+
+#### Phase 1：LSTM Baseline
+
+先用简单的 LSTM 验证数据管线是否正确：
+
+```
+Input [75, 23, 12] → Flatten球员维度 → LSTM → Dense → Output [50, 23, 2]
+```
+
+#### Phase 2：Transformer + Graph Attention（进阶）
+
+```mermaid
+flowchart TB
+    I["输入 [T_obs, N, D]"] --> PE["位置编码\nPositional Encoding"]
+    PE --> TE["Temporal Transformer Encoder\n捕捉时间依赖"]
+    TE --> SA["Spatial Graph Attention\n捕捉球员间交互"]
+    SA --> TD["Temporal Decoder\n逐帧生成未来位置"]
+    TD --> O["输出 [T_pred, N, 2]"]
+```
+
+##### 📖 Transformer 简介（后续专题学习）
+
+Transformer 是一种基于 **Self-Attention（自注意力）** 机制的神经网络架构，核心思想是：对于序列中的每一个元素，让它"关注"序列中所有其他元素，从而捕捉长距离依赖关系。相比 LSTM 逐步处理序列，Transformer **并行处理**整个序列，训练效率更高。
+
+##### 📖 Decoder（解码器）讲解
+
+在 **Encoder-Decoder** 架构中：
+- **Encoder（编码器）**：读取输入序列（过去 3 秒的球员位置），压缩为一个"上下文表示"
+- **Decoder（解码器）**：基于编码器的上下文，**逐步生成**输出序列（未来 2 秒的预测位置）
+
+类比翻译：Encoder 读懂中文句子 → Decoder 逐词生成英文句子。我们的场景：Encoder 理解过去的跑位模式 → Decoder 逐帧预测未来位置。
+
+两种解码方式：
+- **自回归解码**：一帧一帧生成，每帧的输入包含之前已生成的帧（更精确，但慢）
+- **并行解码**：一次性生成所有未来帧（更快，适合实时推理）
+
+#### 损失函数
+
+```python
+# 多目标损失
+loss = α * MSE(pred_pos, true_pos)           # 位置回归
+     + β * SmoothL1(pred_vel, true_vel)       # 速度平滑
+```
+
+#### 训练配置
+
+| 参数 | 建议值 |
+|------|--------|
+| 优化器 | AdamW |
+| 学习率 | 1e-4，Cosine Decay |
+| Batch Size | 32-64 |
+| Epochs | 100-200 |
+| 验证集划分 | 按比赛场次划分（避免数据泄漏） |
+
+---
+
+### 3.7 推理部署层
+
+##### 📖 ONNX 是什么？
+
+**ONNX**（Open Neural Network Exchange）是一种**开放的模型交换格式**。简单说：
+- PyTorch 训练出来的模型是 `.pt` 文件，只有 Python + PyTorch 能加载
+- 导出为 `.onnx` 文件后，**任何语言、任何平台**都可以加载运行（C++、C#、Java…）
+- 通过 **ONNX Runtime**（微软开源的高性能推理引擎）可以在游戏引擎中运行
+
+```mermaid
+flowchart LR
+    PT["PyTorch 模型\n(.pt, Python专用)"] --> ONNX["ONNX 模型\n(.onnx, 跨平台通用)"]
+    ONNX --> CPP["C++ 游戏引擎\n(ONNX Runtime)"]
+    ONNX --> CS["C# Unity\n(ONNX Runtime)"]
+    ONNX --> UE["Unreal Engine\n(ONNX Runtime)"]
+```
+
+##### 引擎格式兼容性
+
+> 用户问：不同引擎的导出格式能否互相转换？
+
+**可以。** ONNX 就是**通用中间格式**，所有主流引擎都支持：
+
+| 游戏引擎 | 推理方案 | 加载格式 |
+|----------|---------|---------|
+| Unreal Engine | ONNX Runtime C++ / NNE 插件 | `.onnx` |
+| Unity | Unity Sentis / Barracuda | `.onnx` |
+| 自研引擎 (C++) | ONNX Runtime / LibTorch | `.onnx` 或 `.pt` |
+
+**结论**：只要导出为 ONNX，所有引擎都能用，不需要额外转换。所以**引擎选型不影响训练阶段**，后续确定即可。
+
+- 推理频率建议 **5-10 Hz**（不需要逐帧推理，节省性能）
+
+---
+
+## 4. 目录结构建议
+
+```
+football-positioning-ai/
+├── data/
+│   ├── raw/                  # 原始数据（Metrica CSV / SkillCorner JSONL）
+│   ├── processed/            # 预处理后的 Parquet/HDF5
+│   └── tensors/              # 切好的训练样本 .pt
+├── src/
+│   ├── extraction/           # 视频 → 坐标提取 (Phase 3)
+│   ├── preprocessing/        # 数据预处理
+│   ├── features/             # 特征工程
+│   ├── model/                # 模型定义
+│   ├── training/             # 训练脚本
+│   │   └── config.yaml       # 特征维度配置
+│   └── export/               # 模型导出
+├── notebooks/                # 探索性分析
+├── tests/
+└── requirements.txt
+```
+
+---
+
+## 5. 推荐实施路线
+
+| 阶段 | 内容 | 预计时间 |
+|------|------|----------|
+| **Phase 1** | 下载 Metrica + SkillCorner 数据 → 预处理 → 滑动窗口切片 → LSTM baseline | 1-2 周 |
+| **Phase 2** | 升级为 Transformer + GNN，扩展特征维度 | 2-3 周 |
+| **Phase 3** | 接入视频提取管线（可选） | 2-3 周 |
+| **Phase 4** | ONNX 导出 → 游戏引擎集成 | 1-2 周 |
