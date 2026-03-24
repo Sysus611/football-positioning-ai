@@ -187,10 +187,10 @@ def build_player_dataset_single_game(
     重要: 不同比赛的同号球员是不同的人!
     所以必须按单场比赛生成数据，不能跨场合并。
 
-    按时间顺序划分:
-      - 上半场 → 训练集
-      - 下半场 → 验证集
-    这样避免数据泄漏(未来信息泄漏到训练集)。
+    划分策略: 按 10 分钟循环 (8 分钟训练 + 2 分钟验证)
+    ┌──TRAIN 8min──┬──VAL 2min──┬──TRAIN 8min──┬──VAL 2min──┬...
+    这样训练数据占 80%，且验证集分布在各个时段。
+    不需要单独的测试集（学习的是单个球员的个人跑位习惯）。
 
     Args:
         df: 单场比赛的 DataFrame
@@ -203,6 +203,7 @@ def build_player_dataset_single_game(
     obs_frames = config["window"]["obs_seconds"] * config["window"]["sample_rate"]
     pred_frames = config["window"]["pred_seconds"] * config["window"]["sample_rate"]
     stride = config["window"]["stride_frames"]
+    sample_rate = config["window"]["sample_rate"]
     all_pids = get_player_ids(df)
 
     # 检查目标球员是否在比赛中
@@ -217,40 +218,57 @@ def build_player_dataset_single_game(
             print(f"    跳过: 有效率 {active_ratio:.0%} < 50%")
             return None, None, None, None
 
-    # 按半场分别处理
-    periods = sorted(df["period"].unique())
-    period_data = {}   # period -> (X, Y)
+    # 循环划分参数 (单位: 帧)
+    TRAIN_MINUTES = 8
+    VAL_MINUTES = 2
+    CYCLE_FRAMES = (TRAIN_MINUTES + VAL_MINUTES) * 60 * sample_rate
+    TRAIN_FRAMES = TRAIN_MINUTES * 60 * sample_rate
 
-    for period in periods:
+    train_X_list, train_Y_list = [], []
+    val_X_list, val_Y_list = [], []
+
+    # 按半场分别处理 (避免跨中场休息的窗口)
+    for period in sorted(df["period"].unique()):
         period_df = df[df["period"] == period].reset_index(drop=True)
+        n_frames = len(period_df)
 
         features = build_context_features(
             period_df, target_pid, all_pids,
             config["pitch"]["length"],
             config["pitch"]["width"],
-            config["window"]["sample_rate"],
+            sample_rate,
         )
         target_pos = build_target(period_df, target_pid)
 
-        X, Y = sliding_window(features, target_pos, obs_frames, pred_frames, stride)
+        # 先生成所有滑动窗口样本
+        X_all, Y_all = sliding_window(features, target_pos, obs_frames, pred_frames, stride)
 
-        if len(X) > 0:
-            period_data[period] = (X, Y)
+        if len(X_all) == 0:
+            continue
 
-    if not period_data:
+        # 每个样本按其起始帧在循环中的位置分配到 train 或 val
+        for i in range(len(X_all)):
+            # 样本起始帧 = i * stride
+            start_frame = i * stride
+            pos_in_cycle = start_frame % CYCLE_FRAMES
+
+            if pos_in_cycle < TRAIN_FRAMES:
+                train_X_list.append(X_all[i])
+                train_Y_list.append(Y_all[i])
+            else:
+                val_X_list.append(X_all[i])
+                val_Y_list.append(Y_all[i])
+
+    if not train_X_list or not val_X_list:
         return None, None, None, None
 
-    # 时间划分: 上半场 → 训练集, 下半场 → 验证集
-    if len(periods) >= 2 and periods[0] in period_data and periods[1] in period_data:
-        X_train, Y_train = period_data[periods[0]]
-        X_val, Y_val = period_data[periods[1]]
-    else:
-        # 只有一个半场的数据，按 80/20 时间顺序划分
-        all_X = np.concatenate([v[0] for v in period_data.values()], axis=0)
-        all_Y = np.concatenate([v[1] for v in period_data.values()], axis=0)
-        split = int(len(all_X) * 0.8)
-        X_train, Y_train = all_X[:split], all_Y[:split]
-        X_val, Y_val = all_X[split:], all_Y[split:]
+    X_train = np.stack(train_X_list)
+    Y_train = np.stack(train_Y_list)
+    X_val = np.stack(val_X_list)
+    Y_val = np.stack(val_Y_list)
+
+    ratio = len(X_train) / (len(X_train) + len(X_val))
+    print(f"    划分: {len(X_train)} train + {len(X_val)} val ({ratio:.0%}/{1-ratio:.0%})")
 
     return X_train, Y_train, X_val, Y_val
 
