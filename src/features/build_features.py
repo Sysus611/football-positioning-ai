@@ -277,6 +277,11 @@ def main():
     """
     为每场比赛的每个球员构建训练数据。
 
+    用法:
+        python build_features.py                    # 所有比赛所有球员
+        python build_features.py game1              # 仅 game1 的所有球员
+        python build_features.py game1 home_11      # 仅 game1 的 home_11
+
     输出文件命名: game1_home_11.npz (比赛名_球员ID)
     每个文件包含: X_train, Y_train, X_val, Y_val
     """
@@ -285,14 +290,29 @@ def main():
     output_dir = os.path.join(PROJECT_ROOT, "data", "tensors")
     os.makedirs(output_dir, exist_ok=True)
 
-    # 查找所有 Parquet 文件
+    # 命令行参数: [game_id] [player_id]
+    filter_game = sys.argv[1] if len(sys.argv) > 1 else None
+    filter_player = sys.argv[2] if len(sys.argv) > 2 else None
+
+    # 查找 Parquet 文件
     parquet_files = sorted([
         os.path.join(processed_dir, f)
         for f in os.listdir(processed_dir)
         if f.endswith(".parquet")
     ])
 
+    # 按 game_id 过滤
+    if filter_game:
+        parquet_files = [p for p in parquet_files if filter_game in os.path.basename(p)]
+        if not parquet_files:
+            print(f"[ERROR] 找不到 {filter_game} 的数据文件!")
+            return
+
     print(f"数据文件: {[os.path.basename(p) for p in parquet_files]}")
+    if filter_game:
+        print(f"[FILTER] 比赛: {filter_game}")
+    if filter_player:
+        print(f"[FILTER] 球员: {filter_player}")
     print(f"观测窗口: {config['window']['obs_seconds']}s = {config['window']['obs_seconds'] * config['window']['sample_rate']} 帧")
     print(f"预测窗口: {config['window']['pred_seconds']}s = {config['window']['pred_seconds'] * config['window']['sample_rate']} 帧")
     print(f"滑动步长: {config['window']['stride_frames']} 帧")
@@ -303,6 +323,14 @@ def main():
         game_id = os.path.basename(parquet_path).replace(".parquet", "")
         df = pd.read_parquet(parquet_path)
         all_pids = get_player_ids(df)
+
+        # 按 player_id 过滤
+        if filter_player:
+            if filter_player not in all_pids:
+                print(f"\n[ERROR] {game_id} 中找不到球员 {filter_player}")
+                print(f"  可用球员: {all_pids}")
+                continue
+            all_pids = [filter_player]
 
         print(f"\n{'='*50}")
         print(f"处理 {game_id}: {len(all_pids)} 个球员")
@@ -341,4 +369,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
