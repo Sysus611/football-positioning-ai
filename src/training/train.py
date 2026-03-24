@@ -146,9 +146,20 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     print(f"  [MODEL] 参数量: {param_count:,}")
     print(f"  [MODEL] 结构: LSTM({X_train.shape[2]}->128, 2层) + FC(128->64->{pred_frames*2})")
 
-    # 损失函数: MSE (均方误差)
-    # 预测位置与真实位置的平方差的平均值
-    criterion = nn.MSELoss()
+    # 损失函数: 时间加权 MSE
+    # 远期帧权重更大 (0.5→2.0)，鼓励模型"敢跑"，解决预测距离偏短的问题
+    # 普通 MSE 会让模型倾向于保守预测 (回归均值)，加权后强调末端精度
+    time_weights = torch.linspace(0.5, 2.0, pred_frames).to(device)  # [pred_frames]
+    time_weights = time_weights / time_weights.mean()  # 归一化使总权重 = pred_frames
+    print(f"  [LOSS] 时间加权 MSE: 权重 {time_weights[0]:.2f}(第1帧) → {time_weights[-1]:.2f}(第{pred_frames}帧)")
+
+    def weighted_mse_loss(pred, target):
+        """时间加权 MSE: 每个时间步的 MSE 乘以对应权重"""
+        # pred, target: [batch, pred_frames, 2]
+        sq_err = (pred - target) ** 2              # [batch, pred_frames, 2]
+        sq_err = sq_err.mean(dim=2)                # [batch, pred_frames] 对 x,y 取平均
+        weighted = sq_err * time_weights            # 乘以时间权重
+        return weighted.mean()                      # 对 batch 和时间取平均
 
     # 优化器: AdamW
     # 负责根据梯度更新模型参数
@@ -183,7 +194,7 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
             batch_y = batch_y.to(device)
 
             pred = model(batch_x)
-            loss = criterion(pred, batch_y)
+            loss = weighted_mse_loss(pred, batch_y)
 
             optimizer.zero_grad()
             loss.backward()
@@ -205,7 +216,7 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
                 batch_x = batch_x.to(device)
                 batch_y = batch_y.to(device)
                 pred = model(batch_x)
-                loss = criterion(pred, batch_y)
+                loss = weighted_mse_loss(pred, batch_y)
                 val_loss += loss.item()
                 n_val_batches += 1
 
