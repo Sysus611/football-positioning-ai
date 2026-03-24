@@ -30,46 +30,41 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def load_player_data(player_id: str, data_dir: str) -> tuple:
+def load_player_data(dataset_id: str, data_dir: str) -> tuple:
     """
     加载球员的训练数据。
 
     Args:
-        player_id: 球员 ID (如 "home_11")
+        dataset_id: 数据集 ID (如 "game1_home_11")
         data_dir: .npz 文件所在目录
 
     Returns:
         (X_train, Y_train, X_val, Y_val) torch Tensor
     """
-    path = os.path.join(data_dir, f"{player_id}.npz")
+    path = os.path.join(data_dir, f"{dataset_id}.npz")
     if not os.path.exists(path):
         return None, None, None, None
 
     print(f"  [DEBUG] 加载数据: {path}")
     data = np.load(path)
-    X = data["X"]   # [n_samples, obs_frames, feat_dim]
-    Y = data["Y"]   # [n_samples, pred_frames, 2]
-    print(f"  [DEBUG] 原始数据 X: {X.shape}, Y: {Y.shape}")
-    print(f"  [DEBUG] X 范围: [{X.min():.4f}, {X.max():.4f}], 均值: {X.mean():.4f}")
-    print(f"  [DEBUG] Y 范围: [{Y.min():.4f}, {Y.max():.4f}], 均值: {Y.mean():.4f}")
-    print(f"  [DEBUG] X 中 NaN 数: {np.isnan(X).sum()}, 零值占比: {(X==0).mean():.2%}")
-    print(f"  [DEBUG] Y 中 NaN 数: {np.isnan(Y).sum()}, 零值占比: {(Y==0).mean():.2%}")
 
-    # 按 80/20 划分训练集和验证集
-    n = len(X)
-    split = int(n * 0.8)
+    # 新格式: 已包含 train/val 划分 (上半场训练, 下半场验证)
+    X_train_np = data["X_train"]
+    Y_train_np = data["Y_train"]
+    X_val_np = data["X_val"]
+    Y_val_np = data["Y_val"]
 
-    # 随机打乱
-    indices = np.random.permutation(n)
-    X = X[indices]
-    Y = Y[indices]
+    print(f"  [DEBUG] 训练集 X: {X_train_np.shape}, Y: {Y_train_np.shape}")
+    print(f"  [DEBUG] 验证集 X: {X_val_np.shape}, Y: {Y_val_np.shape}")
+    print(f"  [DEBUG] X 范围: [{X_train_np.min():.4f}, {X_train_np.max():.4f}], 均值: {X_train_np.mean():.4f}")
+    print(f"  [DEBUG] Y 范围: [{Y_train_np.min():.4f}, {Y_train_np.max():.4f}], 均值: {Y_train_np.mean():.4f}")
+    print(f"  [DEBUG] X NaN: {np.isnan(X_train_np).sum()}, 零值: {(X_train_np==0).mean():.2%}")
 
-    X_train = torch.from_numpy(X[:split])
-    Y_train = torch.from_numpy(Y[:split])
-    X_val = torch.from_numpy(X[split:])
-    Y_val = torch.from_numpy(Y[split:])
+    X_train = torch.from_numpy(X_train_np)
+    Y_train = torch.from_numpy(Y_train_np)
+    X_val = torch.from_numpy(X_val_np)
+    Y_val = torch.from_numpy(Y_val_np)
 
-    print(f"  [DEBUG] 划分完成: 训练 {len(X_train)}, 验证 {len(X_val)}")
     return X_train, Y_train, X_val, Y_val
 
 

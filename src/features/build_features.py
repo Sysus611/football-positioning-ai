@@ -176,75 +176,92 @@ def sliding_window(
     return X, Y
 
 
-def build_player_dataset(
-    parquet_paths: list,
+def build_player_dataset_single_game(
+    df: pd.DataFrame,
     target_pid: str,
     config: dict,
 ) -> tuple:
     """
-    从多场比赛构建一个球员的完整训练数据。
+    从单场比赛构建一个球员的训练数据。
+
+    重要: 不同比赛的同号球员是不同的人!
+    所以必须按单场比赛生成数据，不能跨场合并。
+
+    按时间顺序划分:
+      - 上半场 → 训练集
+      - 下半场 → 验证集
+    这样避免数据泄漏(未来信息泄漏到训练集)。
 
     Args:
-        parquet_paths: Parquet 文件路径列表
+        df: 单场比赛的 DataFrame
         target_pid: 目标球员 ID
         config: 配置字典
 
     Returns:
-        (X, Y) numpy 数组
+        (X_train, Y_train, X_val, Y_val) numpy 数组
     """
     obs_frames = config["window"]["obs_seconds"] * config["window"]["sample_rate"]
     pred_frames = config["window"]["pred_seconds"] * config["window"]["sample_rate"]
     stride = config["window"]["stride_frames"]
+    all_pids = get_player_ids(df)
 
-    all_X = []
-    all_Y = []
+    # 检查目标球员是否在比赛中
+    if f"{target_pid}_x" not in df.columns:
+        return None, None, None, None
 
-    for path in parquet_paths:
-        df = pd.read_parquet(path)
-        all_pids = get_player_ids(df)
+    # 检查有效率
+    active_col = f"{target_pid}_active"
+    if active_col in df.columns:
+        active_ratio = df[active_col].mean()
+        if active_ratio < 0.5:
+            print(f"    跳过: 有效率 {active_ratio:.0%} < 50%")
+            return None, None, None, None
 
-        # 检查目标球员是否在这场比赛中
-        if f"{target_pid}_x" not in df.columns:
-            continue
+    # 按半场分别处理
+    periods = sorted(df["period"].unique())
+    period_data = {}   # period -> (X, Y)
 
-        # 检查该球员是否有足够的有效数据
-        active_col = f"{target_pid}_active"
-        if active_col in df.columns:
-            active_ratio = df[active_col].mean()
-            if active_ratio < 0.5:
-                print(f"    {os.path.basename(path)}: 跳过 (有效率 {active_ratio:.0%})")
-                continue
+    for period in periods:
+        period_df = df[df["period"] == period].reset_index(drop=True)
 
-        # 按 period (上下半场) 分别处理，避免跨半场的窗口
-        for period in df["period"].unique():
-            period_df = df[df["period"] == period].reset_index(drop=True)
+        features = build_context_features(
+            period_df, target_pid, all_pids,
+            config["pitch"]["length"],
+            config["pitch"]["width"],
+            config["window"]["sample_rate"],
+        )
+        target_pos = build_target(period_df, target_pid)
 
-            features = build_context_features(
-                period_df, target_pid, all_pids,
-                config["pitch"]["length"],
-                config["pitch"]["width"],
-                config["window"]["sample_rate"],
-            )
-            target_pos = build_target(period_df, target_pid)
+        X, Y = sliding_window(features, target_pos, obs_frames, pred_frames, stride)
 
-            X, Y = sliding_window(features, target_pos, obs_frames, pred_frames, stride)
+        if len(X) > 0:
+            period_data[period] = (X, Y)
 
-            if len(X) > 0:
-                all_X.append(X)
-                all_Y.append(Y)
+    if not period_data:
+        return None, None, None, None
 
-    if not all_X:
-        return np.array([]), np.array([])
+    # 时间划分: 上半场 → 训练集, 下半场 → 验证集
+    if len(periods) >= 2 and periods[0] in period_data and periods[1] in period_data:
+        X_train, Y_train = period_data[periods[0]]
+        X_val, Y_val = period_data[periods[1]]
+    else:
+        # 只有一个半场的数据，按 80/20 时间顺序划分
+        all_X = np.concatenate([v[0] for v in period_data.values()], axis=0)
+        all_Y = np.concatenate([v[1] for v in period_data.values()], axis=0)
+        split = int(len(all_X) * 0.8)
+        X_train, Y_train = all_X[:split], all_Y[:split]
+        X_val, Y_val = all_X[split:], all_Y[split:]
 
-    # np.concatenate 把多个数组沿第 0 轴拼接
-    X = np.concatenate(all_X, axis=0)
-    Y = np.concatenate(all_Y, axis=0)
-
-    return X, Y
+    return X_train, Y_train, X_val, Y_val
 
 
 def main():
-    """为每个球员构建训练数据"""
+    """
+    为每场比赛的每个球员构建训练数据。
+
+    输出文件命名: game1_home_11.npz (比赛名_球员ID)
+    每个文件包含: X_train, Y_train, X_val, Y_val
+    """
     config = load_config()
     processed_dir = os.path.join(PROJECT_ROOT, "data", "processed")
     output_dir = os.path.join(PROJECT_ROOT, "data", "tensors")
@@ -258,40 +275,52 @@ def main():
     ])
 
     print(f"数据文件: {[os.path.basename(p) for p in parquet_files]}")
-
-    # 获取所有球员 ID (从第一个文件)
-    first_df = pd.read_parquet(parquet_files[0])
-    all_pids = get_player_ids(first_df)
-
-    print(f"球员总数: {len(all_pids)}")
     print(f"观测窗口: {config['window']['obs_seconds']}s = {config['window']['obs_seconds'] * config['window']['sample_rate']} 帧")
     print(f"预测窗口: {config['window']['pred_seconds']}s = {config['window']['pred_seconds'] * config['window']['sample_rate']} 帧")
     print(f"滑动步长: {config['window']['stride_frames']} 帧")
 
-    # 为每个球员构建数据
-    for pid in all_pids:
-        print(f"\n--- 构建 {pid} 的数据 ---")
+    total_datasets = 0
 
-        X, Y = build_player_dataset(parquet_files, pid, config)
+    for parquet_path in parquet_files:
+        game_id = os.path.basename(parquet_path).replace(".parquet", "")
+        df = pd.read_parquet(parquet_path)
+        all_pids = get_player_ids(df)
 
-        if len(X) == 0:
-            print(f"  跳过: 无有效样本")
-            continue
+        print(f"\n{'='*50}")
+        print(f"处理 {game_id}: {len(all_pids)} 个球员")
+        print(f"{'='*50}")
 
-        # 保存为 .npz (numpy 压缩格式, 比 .pt 不依赖 PyTorch)
-        output_path = os.path.join(output_dir, f"{pid}.npz")
-        np.savez_compressed(output_path, X=X, Y=Y)
+        for pid in all_pids:
+            print(f"\n  --- {game_id}_{pid} ---")
 
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"  样本数: {X.shape[0]}")
-        print(f"  X shape: {X.shape}  (样本数, 观测帧数, 特征维度)")
-        print(f"  Y shape: {Y.shape}  (样本数, 预测帧数, 2)")
-        print(f"  已保存: {output_path} ({size_mb:.1f} MB)")
+            result = build_player_dataset_single_game(df, pid, config)
+            if result[0] is None:
+                print(f"    跳过: 无有效样本")
+                continue
+
+            X_train, Y_train, X_val, Y_val = result
+
+            # 保存为 .npz ，包含已划分的 train/val
+            output_path = os.path.join(output_dir, f"{game_id}_{pid}.npz")
+            np.savez_compressed(
+                output_path,
+                X_train=X_train, Y_train=Y_train,
+                X_val=X_val, Y_val=Y_val,
+            )
+
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"    训练集: {X_train.shape[0]} 样本")
+            print(f"    验证集: {X_val.shape[0]} 样本")
+            print(f"    X shape: {X_train.shape}  (样本, 帧, 特征)")
+            print(f"    已保存: {output_path} ({size_mb:.1f} MB)")
+            total_datasets += 1
 
     print(f"\n{'='*50}")
-    print(f"特征工程完成! 输出: {output_dir}")
+    print(f"特征工程完成! 共 {total_datasets} 个数据集")
+    print(f"输出: {output_dir}")
     print(f"{'='*50}")
 
 
 if __name__ == "__main__":
     main()
+
