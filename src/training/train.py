@@ -12,6 +12,7 @@ LSTM 训练脚本 (单球员模型)
 import os
 import sys
 import time
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -104,11 +105,12 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     print(f"  验证集: {X_val.shape[0]} 样本")
     print(f"  输入维度: {X_train.shape[2]}")
 
-    # 参数
-    batch_size = config["training"]["batch_size"]
-    epochs = config["training"]["epochs"]
-    lr = config["training"]["learning_rate"]
-    pred_frames = config["window"]["pred_seconds"] * config["window"]["sample_rate"]
+    # 参数 (支持环境变量覆盖)
+    batch_size = int(os.environ.get("BATCH_SIZE", config["training"]["batch_size"]))
+    epochs = int(os.environ.get("EPOCHS", config["training"]["epochs"]))
+    lr = float(os.environ.get("LR", config["training"]["learning_rate"]))
+    pred_frames = int(os.environ.get("PRED_FRAMES",
+        config["window"]["pred_seconds"] * config["window"]["sample_rate"]))
 
     print(f"  [CONFIG] batch_size={batch_size}, epochs={epochs}, lr={lr}")
     print(f"  [CONFIG] pred_frames={pred_frames}, obs_frames={X_train.shape[1]}")
@@ -178,6 +180,8 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     max_patience = 25   # 早停: 连续 25 个 epoch 无改善就停止
 
     start_time = time.time()
+    train_losses = []   # 记录每个 epoch 的 loss 用于画图
+    val_losses = []
     print(f"\n  {'Epoch':>5s} | {'Train Loss':>10s} | {'Val Loss':>10s} | {'Dist(m)':>8s} | {'LR':>10s} | {'Time':>6s} | Status")
     print(f"  {'-'*5}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*10}-+-{'-'*6}-+-------")
 
@@ -228,6 +232,10 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
 
         scheduler.step(val_loss)
 
+        # 记录 loss 历史
+        train_losses.append(float(train_loss))
+        val_losses.append(float(val_loss))
+
         # 每 5 个 epoch 或首末 epoch 打印
         epoch_time = time.time() - epoch_start
         elapsed = time.time() - start_time
@@ -271,6 +279,17 @@ def train_player(player_id: str, config: dict, data_dir: str, model_dir: str):
     print(f"  [DONE] 最佳 val_loss: {best_val_loss:.6f} (~{best_dist_m:.2f}m 平均误差)")
     print(f"  [DONE] 总耗时: {elapsed:.0f}s ({elapsed/60:.1f}min)")
     print(f"  [DONE] 模型已保存: {model_dir}/{player_id}.pt")
+
+    # 保存 loss 历史到 JSON (用于画图)
+    history_path = os.path.join(model_dir, f"{player_id}_history.json")
+    with open(history_path, "w") as f:
+        json.dump({
+            "train_losses": train_losses,
+            "val_losses": val_losses,
+            "best_epoch": best_epoch,
+            "best_val_loss": float(best_val_loss),
+        }, f)
+    print(f"  [DONE] Loss 历史: {history_path}")
 
 
 def main():

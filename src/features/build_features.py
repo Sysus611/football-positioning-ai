@@ -290,6 +290,16 @@ def main():
     output_dir = os.path.join(PROJECT_ROOT, "data", "tensors")
     os.makedirs(output_dir, exist_ok=True)
 
+    # 环境变量覆盖窗口参数 (从 notebook 配置 Cell 传入)
+    if "OBS_SECONDS" in os.environ:
+        config["window"]["obs_seconds"] = int(os.environ["OBS_SECONDS"])
+    if "PRED_SECONDS" in os.environ:
+        config["window"]["pred_seconds"] = int(os.environ["PRED_SECONDS"])
+    if "SAMPLE_RATE" in os.environ:
+        config["window"]["sample_rate"] = int(os.environ["SAMPLE_RATE"])
+    if "STRIDE_FRAMES" in os.environ:
+        config["window"]["stride_frames"] = int(os.environ["STRIDE_FRAMES"])
+
     # 命令行参数: [game_id] [player_id]
     filter_game = sys.argv[1] if len(sys.argv) > 1 else None
     filter_player = sys.argv[2] if len(sys.argv) > 2 else None
